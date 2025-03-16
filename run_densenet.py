@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.distributions
 from utils import get_dataset_list, CustomFaceDataset, cycle, get_val_hter, TPC_loss
-from vgg_face_dag import vgg_face_dag, spoof_model
+from vgg_face_dag import vgg_face_dag, spoof_model2
 import pdb
 import torchvision.utils as tutil
 import argparse
@@ -36,62 +36,6 @@ os.makedirs(args.outputPath,exist_ok=True)
 np.set_printoptions(formatter='10.3f')
 torch.set_printoptions(sci_mode=False, threshold=5000)
 
-#My custom vgg16 that can get the appropriate features and cams
-class VGG(torch.nn.Module):
-    def __init__(self):
-        super(VGG, self).__init__()
-        # Make the vgg16 into a binary classifier
-        self.model = torchvision.models.vgg16(pretrained=True)
-        self.num_features = self.model.classifier[-1].in_features
-        self.model.classifier[-1] = torch.nn.Linear(self.num_features, 2)
-
-        # Apply the hooks (defined below)
-        self.target_layer = self.model.features[-1]
-        self.target_layer.register_forward_hook(self.forward_hook)
-        self.model.classifier[1].register_forward_hook(self.feature_hook)
-
-        # Storage for calculating the gradcams and features
-        self.activations = None
-        self.gradients = None
-        self.features = None
-
-    def forward_hook(self, module, input, output):
-        self.activations = output
-
-    def feature_hook(self, module, input, output):
-        self.features = output
-
-    def logits(self, batchdata):
-        return self.model(batchdata)
-
-    def cams(self, batchdata, classes = None):
-        if classes == None:
-            classes = torch.zeros(batchdata.shape[0],dtype=int)
-        logits = self.model(batchdata)
-
-        self.model.zero_grad()
-        self.gradients = torch.autograd.grad(logits[:,classes].sum(), self.activations,retain_graph=True)[0]
-        weights = self.gradients.mean(dim=[2, 3], keepdim=True)
-        cam = (weights * self.activations).sum(dim=1)
-        cam = F.relu(cam)
-        maxes = cam.view([-1,49]).max(1,keepdim=True)[0]
-        cams = (cam.view([-1,49]) / maxes).view([-1,7,7])
-
-        return cams
-        
-    def forward(self, batchdata, classes = None):
-        # Return Features
-        self.model(batchdata)
-        return self.features
-
-# for Fixing the seed
-# torch.manual_seed(0)
-#
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
-#
-# np.random.seed(0)
-
 from dataset_Loader_cam import datasetLoader
 map_size = 7
 im_size = 224
@@ -102,15 +46,16 @@ dataset = datasetLoader(args.csvPath,args.datasetPath, train_test='test', c2i=da
 test = torch.utils.data.DataLoader(dataset, batch_size=run_parameters['train_batch_size'], shuffle=True, num_workers=0, pin_memory=True)
 dataloader = {'train': dl, 'test': test}
 
-
 # load model
-face_model = VGG()
+face_model = torchvision.models.densenet121(pretrained=True)
+num_ftrs = face_model.classifier.in_features
+face_model.classifier = nn.Linear(num_ftrs, args.nClasses)
+
+spoof_classifier = spoof_model2(run_parameters['dimension'])
+spoof_classifier.train()
 
 # set train mode
 face_model.train()
-
-spoof_classifier = spoof_model(run_parameters['dimension'])
-spoof_classifier.train()
 
 if run_parameters['multi_gpu']:
     face_model = nn.DataParallel(face_model)
@@ -142,8 +87,9 @@ for ep in range(run_parameters['epoch']):
                 cls = cls.cuda()
                 face_model.eval()
                 spoof_classifier.eval()
-                features = face_model(data)
-                logits = spoof_classifier(features)
+                features = face_model.features(data)
+                input_features = nn.AdaptiveAvgPool2d((1, 1))(features).view([-1,1024])
+                logits = spoof_classifier(input_features)
                 predictions = torch.max(logits,dim=1)[1]
                 correct = torch.sum((predictions == cls).int())
                 batch_accuracy += correct/data.shape[0]
@@ -156,16 +102,36 @@ for ep in range(run_parameters['epoch']):
                 spoof_classifier.train()
                 vgg_optim.zero_grad()
                 spoof_optim.zero_grad()
+
+                features = face_model.features(data)
+                input_features = nn.AdaptiveAvgPool2d((1, 1))(features).view([-1,1024])
+                logits = spoof_classifier(input_features)
+                predictions = torch.max(logits,dim=1)[1]
                 
-                features = face_model(data)
-    
-                cams = face_model.cams(data)
+                params = list(spoof_classifier.fc.parameters())[0]
+                bz, nc, h, w = features.shape
+                beforeDot =  features.reshape((bz, nc, h*w))
+                cams = []
+                entrops = []
+                for ids,bd in enumerate(beforeDot):
+                    weight = params[predictions[ids]]
+                    cam = torch.matmul(weight, bd)
+                    cam_img = cam.reshape(h, w)
+                    cam_img = cam_img - torch.min(cam_img)
+                    cam_img = cam_img / torch.max(cam_img)
+                    cams.append(cam_img)
+                    sum_M_i_j = torch.sum(cam_img)
+                    cam_img_prob = cam_img / (sum_M_i_j + 1e-10) + 1e-10
+                    entrop = -torch.sum(cam_img_prob * torch.log(cam_img_prob))
+                    entrops.append(entrop)
+                cams = torch.stack(cams)
+                entrops = torch.stack(entrops)
                 salience_comp = criterion_hmap(cams,hmap)
         
                 # spoof work
                 if run_parameters['white_noise']:
                     # push from origin
-                    sampler = torch.distributions.multivariate_normal.MultivariateNormal(torch.zeros(run_parameters['dimension']).cuda(),  \
+                    sampler = torch.distributions.multivariate_normal.MultivariateNormal(torch.zeros([1024]).cuda(),  \
                                                                                          run_parameters['std_dev'] * torch.eye(run_parameters['dimension']).cuda())
                 else:
                     # push from shifted mean cluster
@@ -186,7 +152,7 @@ for ep in range(run_parameters['epoch']):
                 # sample from pseudo-negative gaussian
                 noise = sampler.sample((features.shape[0],))
                 noise = noise.cuda()
-                spoof_input = torch.cat([features, noise], dim=0)
+                spoof_input = torch.cat([input_features, noise], dim=0)
         
                 spoof_output = spoof_classifier(spoof_input)
         
@@ -207,16 +173,18 @@ for ep in range(run_parameters['epoch']):
                 spoof_optim.step()
                 if batch_idx % 10 == 0:
                     print("Epoch: {0}, Salience Loss: {1}, Spoof Loss: {2}, Total Loss: {3}".format(ep,salience_comp.item(), spoof_loss.item(), loss.item()))
-    states = {
-        'epoch': ep + 1,
-        'face_state_dict': face_model.state_dict(),
-        'face_optimizer': vgg_optim.state_dict(),
-        'spoof_state_dict': spoof_classifier.state_dict(),
-        'spoof_optimizer': spoof_optim.state_dict()
-    }
-    if phase == 'train':
-        torch.save(states, os.path.join(args.outputPath,f'current_model.pth'))
-    if phase == 'test':
-        accuracy = batch_accuracy/(batch_idx+1)
-        if accuracy > best_test:
-            torch.save(states, os.path.join(args.outputPath, f'best_model.pth'))
+        states = {
+            'epoch': ep + 1,
+            'face_state_dict': face_model.state_dict(),
+            'face_optimizer': vgg_optim.state_dict(),
+            'spoof_state_dict': spoof_classifier.state_dict(),
+            'spoof_optimizer': spoof_optim.state_dict()
+        }
+        if phase == 'train':
+            torch.save(states, os.path.join(args.outputPath,f'current_model.pth'))
+        if phase == 'test':
+            accuracy = batch_accuracy/(batch_idx+1)
+            print(f'Test - Epoch: {ep}, Current acc: {accuracy}, Best acc: {best_test}')
+            if accuracy >= best_test:
+                torch.save(states, os.path.join(args.outputPath, f'best_model.pth'))
+                best_test = accuracy
