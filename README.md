@@ -23,6 +23,16 @@ cd face-spoof-detection
 ### **2. Dependancies**
 pytorch, cv2, tdqm
 
+### **2.5 CSV formatting**
+Training csv: Each line should be of the following format: 
+```
+Partition (typically 'train' or 'test'),Label (e.g. Live or Spoof), Location (appended to -datasetPath in run_densenet.py)
+```
+Note that in the training csv, test is actually the validation set.
+
+The testing csv should be the same format, but every line will be test.
+
+
 ### **3. Dataset structure and training**
 The dataset should be structured as follows:
 
